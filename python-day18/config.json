@@ -1,0 +1,9 @@
+{
+  "directory": "/tmp",
+  "mode": "all",
+  "top": 5,
+  "min_size": 1,
+  "relative": true,
+  "json": true,
+  "out": "report-from-config.json"
+}
