@@ -1,0 +1,18 @@
+{
+  "directory": "/private/tmp",
+  "mode": "file",
+  "min_size": 0,
+  "count": 2,
+  "total_bytes": 55,
+  "top_n": 2,
+  "top": [
+    {
+      "path": "/private/tmp/.s.PGSQL.5432.lock",
+      "size_bytes": 55
+    },
+    {
+      "path": "/private/tmp/hoge",
+      "size_bytes": 0
+    }
+  ]
+}

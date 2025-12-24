@@ -1,0 +1,577 @@
+"""
+Day19: ミニCLIツール（大きいファイルTOP N）— 設定ファイル（env / json）
+
+このプログラムは、指定ディレクトリ以下を再帰的に走査して、
+「サイズが大きい順の TOP N」を表示/JSON出力するCLIツール。
+
++Day17のポイント：
+- httpx を使って外部APIにPOSTする（I/O追加）
+- stdoutのJSONを壊さないため、HTTPの成否ログは logging(stderr) 側へ寄せる
+- 計算部分（topN保持）は Day15 のまま（ストリーミング）
+
+Day19のポイント
+- JSON config（Day18）に加えて、環境変数（env）/ .envファイル（--env-file）で設定できる
+- 優先順位：CLI > env > config
+
+使い方：
+    python main.py [directory] [--min-size N] [--top N] [--human] [--json] [--verbose] [--relative]
+"""
+
+from __future__ import annotations
+
+import argparse
+import heapq
+import json
+import logging
+import os
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable, Iterator, Tuple
+
+# このプログラムで学習してほしいこと（Day9の狙い）
+# - argparse: 位置引数 + フラグ + choices + 数値引数（--top）を扱う
+# - Path: 再帰走査（rglob）と stat を使う
+# - try/except: 取れないstatがあっても落ちないCLIを作る
+# - 「仕様（何を数えるか）」を mode として外に出す（Day8）
+# - 「上位N件」の抽出で heapq.nlargest を使う（Day9）
+
+
+def human_size(size: int) -> str:
+    """バイト数を人間向け表記に変換する"""
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    value = float(size)
+
+    for unit in units:
+        is_small_enough = value < 1024
+        is_last_unit = unit == units[-1]
+        if is_small_enough or is_last_unit:
+            if unit == "B":
+                return f"{int(value)}B"
+            return f"{value:.1f}{unit}"
+
+        # 次の単位へ（B→KB→MB...）
+        value /= 1024
+
+    # 通常ここには到達しない（保険）
+    return f"{int(value)}{units[-1]}"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """
+    CLI引数を定義して、解析結果（args）を返す。
+    - directory: 省略可能な位置引数（デフォルトはカレント）
+    - --human: サイズを人間向けに表示するスイッチ
+    - --verbose: 走査中の詳細ログを出すスイッチ
+    - --mode: 何を「数える」対象とするか（Day8で追加）
+    - --relative: 出力パスをrootからの相対パスにする（Day13）
+    - --post: JSON payloadをHTTP POSTで送る（Day17）
+    """
+    parser = argparse.ArgumentParser(description="List largest files under a directory (recursively).")
+
+    parser.add_argument(
+        "directory",
+        nargs="?",
+        default=None,  # Day18: configで上書きできるように「未指定」を区別する
+        type=Path,
+        help="走査対象のディレクトリ（省略時はカレントディレクトリ）",
+    )
+
+    parser.add_argument(
+        "--mode",
+        choices=["file", "all"],
+        default="file",
+        help="数える対象を指定する（file: 通常ファイルのみ、all: ディレクトリ以外すべて）",
+    )
+
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=10,
+        help="Show top N largest entries (default: 10). Use 0 to disable listing.",
+    )
+
+    parser.add_argument("--human", action="store_true", help="サイズを人間向け表記で表示する")
+    parser.add_argument("--verbose", action="store_true", help="走査中の詳細ログを表示する")
+    parser.add_argument("--json", action="store_true", help="集計結果をJSON形式で出力する")
+
+    parser.add_argument(
+        "--min-size",
+        type=int,
+        default=0,
+        help="指定したサイズ（バイト）以上のエントリのみを集計対象とする",
+    )
+
+    parser.add_argument("--relative", action="store_true", help="出力するパスをrootからの相対パスにする")
+
+    parser.add_argument(
+        "--post",
+        type=str,
+        default="",
+        help="集計結果のJSONをPOSTするURLを指定する（指定しない場合はPOSTしない）",
+    )
+
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="HTTP POSTのタイムアウト秒数（デフォルト: 10.0秒）",
+    )
+
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="JSON config file path (e.g., config.json). CLI args override config.",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Write the JSON payload to a file (e.g., report.json).",
+    )
+
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=None,
+        help="Load environment variables from a .env file before processing (e.g., .env).",
+    )
+
+    return parser.parse_args(argv)
+
+
+def parse_provided_options(argv: list[str]) -> set[str]:
+    """
+    Day18: どのオプションがCLIで明示されたかを判定する。
+    これにより「既定値」なのか「ユーザー指定」なのかを区別し、
+    configの値で上書きしてよいか判断できる。
+    """
+    if argv is None:
+        return set()
+    provided: set[str] = set()
+    for token in argv:
+        if token.startswith("--"):
+            provided.add(token.split("=", 1)[0])
+    return provided
+
+
+def load_config(path: Path, logger: logging.Logger) -> dict[str, Any]:
+    """
+    Day18: JSON設定ファイルを読み込む。
+    期待する例：
+      {"directory": "/tmp", "mode": "all", "top": 20, "min_size": 1024, "relative": true}
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+        data = json.loads(text)
+    except Exception as exc:
+        logger.error("config load failed: %s (%s)", path, exc)
+        return {}
+    if not isinstance(data, dict):
+        logger.error("config must be a JSON object: %s", path)
+        return {}
+    return data
+
+
+def apply_config(args: argparse.Namespace, cfg: dict[str, Any], provided: set[str], logger: logging.Logger) -> None:
+    """
+    Day18: configの値を args に反映する（ただしCLI指定が優先）。
+    - CLIで明示されたオプションは上書きしない
+    """
+
+    def has(name: str) -> bool:
+        return name in cfg
+
+    if args.directory is None and has("directory"):
+        args.directory = Path(str(cfg["directory"]))
+
+    if "--mode" not in provided and has("mode"):
+        args.mode = str(cfg["mode"])
+    if "--top" not in provided and has("top"):
+        args.top = int(cfg["top"])
+    if "--min-size" not in provided and has("min_size"):
+        args.min_size = int(cfg["min_size"])
+    if "--timeout" not in provided and has("timeout"):
+        args.timeout = float(cfg["timeout"])
+    if "--post" not in provided and has("post"):
+        args.post = str(cfg["post"])
+    if "--out" not in provided and has("out"):
+        args.out = Path(str(cfg["out"]))
+
+    if "--human" not in provided and has("human"):
+        args.human = bool(cfg["human"])
+    if "--verbose" not in provided and has("verbose"):
+        args.verbose = bool(cfg["verbose"])
+    if "--json" not in provided and has("json"):
+        args.json = bool(cfg["json"])
+    if "--relative" not in provided and has("relative"):
+        args.relative = bool(cfg["relative"])
+
+
+def parse_bool(value: str) -> bool:
+    """
+    Day19: env用のboolパース。
+    true: 1, true, yes, y, on
+    false: 0, false, no, n, off
+    """
+    v = value.strip().lower()
+    if v in {"1", "true", "yes", "y", "on"}:
+        return True
+    if v in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(v)
+
+
+def load_env_file(path: Path, logger: logging.Logger) -> dict[str, str]:
+    """
+    Day19: .env 形式（KEY=VALUE）を読む。標準ライブラリのみで実装。
+    - 空行/コメント(#...)は無視
+    - `export KEY=VALUE` も許容
+    - VALUEの前後のクォート（' "）は雑に剥がす
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception as exc:
+        logger.error("env file load failed: %s (%s)", path, exc)
+        return {}
+
+    env: dict[str, str] = {}
+    for row in text.splitlines():
+        line = row.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+            val = val[1:-1]
+        if key:
+            env[key] = val
+    return env
+
+
+def get_env(name: str, env_file: dict[str, str]) -> str | None:
+    """
+    Day19: 環境変数取得。
+    優先順位：env-file（--env-file） > OS環境変数
+    ※ --env-file を明示したときは、既存のOS環境変数より .env を優先したい
+    """
+    v = env_file.get(name)
+    if v is not None and v != "":
+        return v
+    v = os.getenv(name)
+    if v is not None and v != "":
+        return v
+    return None
+
+
+def apply_env(
+    args: argparse.Namespace,
+    env_file: dict[str, str],
+    provided: set[str],
+    logger: logging.Logger,
+    directory_from_cli: bool,
+) -> None:
+    """
+    Day19: envの値を args に反映する（ただしCLI指定が優先）。
+    優先順位：CLI > env > config（configは先に適用しておく）
+
+    対応する環境変数名：
+      DIRSCAN_DIRECTORY, DIRSCAN_MODE, DIRSCAN_TOP, DIRSCAN_MIN_SIZE,
+      DIRSCAN_HUMAN, DIRSCAN_VERBOSE, DIRSCAN_JSON, DIRSCAN_RELATIVE,
+      DIRSCAN_POST, DIRSCAN_TIMEOUT, DIRSCAN_OUT, DIRSCAN_CONFIG
+    """
+    if "--config" not in provided and args.config is None:
+        v = get_env("DIRSCAN_CONFIG", env_file)
+        if v:
+            args.config = Path(v)
+
+    if not directory_from_cli:
+        v = get_env("DIRSCAN_DIRECTORY", env_file)
+        if v:
+            args.directory = Path(v)
+
+    if "--mode" not in provided:
+        v = get_env("DIRSCAN_MODE", env_file)
+        if v:
+            args.mode = v
+    if "--top" not in provided:
+        v = get_env("DIRSCAN_TOP", env_file)
+        if v:
+            args.top = int(v)
+    if "--min-size" not in provided:
+        v = get_env("DIRSCAN_MIN_SIZE", env_file)
+        if v:
+            args.min_size = int(v)
+    if "--timeout" not in provided:
+        v = get_env("DIRSCAN_TIMEOUT", env_file)
+        if v:
+            args.timeout = float(v)
+    if "--post" not in provided:
+        v = get_env("DIRSCAN_POST", env_file)
+        if v:
+            args.post = v
+
+    # out は env が config を上書きできる必要がある（CLI以外は上書きOK）
+    if "--out" not in provided:
+        v = get_env("DIRSCAN_OUT", env_file)
+        if v:
+            args.out = Path(v)
+
+    if "--human" not in provided:
+        v = get_env("DIRSCAN_HUMAN", env_file)
+        if v is not None:
+            args.human = parse_bool(v)
+    if "--verbose" not in provided:
+        v = get_env("DIRSCAN_VERBOSE", env_file)
+        if v is not None:
+            args.verbose = parse_bool(v)
+    if "--json" not in provided:
+        v = get_env("DIRSCAN_JSON", env_file)
+        if v is not None:
+            args.json = parse_bool(v)
+    if "--relative" not in provided:
+        v = get_env("DIRSCAN_RELATIVE", env_file)
+        if v is not None:
+            args.relative = parse_bool(v)
+
+    logger.info("env applied (CLI overrides env)")
+
+
+def setup_logger(verbose: bool) -> logging.Logger:
+    """
+    Day14: ログをstderrに出すためのloggerを構成する。
+    - verbose=False: WARNING以上
+    - verbose=True : INFO以上
+    """
+    logger = logging.getLogger("dirscan")
+    logger.setLevel(logging.INFO if verbose else logging.WARNING)
+    logger.propagate = False
+
+    logger.handlers.clear()
+
+    handler = logging.StreamHandler(stream=sys.stderr)
+    handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(handler)
+    return logger
+
+
+def should_count(path: Path, mode: str) -> bool:
+    if mode == "file":
+        return path.is_file()
+    if mode == "all":
+        return not path.is_dir()
+    return False
+
+
+@dataclass(frozen=True)
+class Entry:
+    path: Path
+    size: int
+
+
+@dataclass(frozen=True)
+class Stats:
+    count: int
+    total_bytes: int
+    top: list[Entry]
+
+
+def format_path(path: Path, root: Path, relative: bool) -> str:
+    if not relative:
+        return str(path)
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+def iter_entries(root: Path, mode: str, min_size: int, logger: logging.Logger) -> Iterator[Entry]:
+    for path in root.rglob("*"):
+        if not should_count(path, mode):
+            continue
+
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            logger.info("[skip] %s: %s", path, exc)
+            continue
+
+        if size < min_size:
+            continue
+
+        yield Entry(path=path, size=size)
+
+
+def find_top_n(entries: list[Entry], n: int) -> list[Entry]:
+    if n <= 0:
+        return []
+
+    top = heapq.nlargest(n, entries, key=lambda e: e.size)
+    top.sort(key=lambda e: (-e.size, str(e.path)))
+    return top
+
+
+def compute_stats(entries: Iterable[Entry], top_n: int) -> Stats:
+    count = 0
+    total_bytes = 0
+    heap: list[Tuple[int, str, Entry]] = []
+
+    for e in entries:
+        count += 1
+        total_bytes += e.size
+
+        if top_n <= 0:
+            continue
+
+        item = (e.size, str(e.path), e)
+        if len(heap) < top_n:
+            heapq.heappush(heap, item)
+        else:
+            if item > heap[0]:
+                heapq.heapreplace(heap, item)
+
+    top_entries = [t[2] for t in sorted(heap, key=lambda t: (-t[0], t[1]))]
+
+    return Stats(count=count, total_bytes=total_bytes, top=top_entries)
+
+
+def build_json_payload(root: Path, mode: str, min_size: int, top_n: int, stats: Stats, relative: bool) -> dict[str, Any]:
+    return {
+        "directory": str(root),
+        "mode": mode,
+        "min_size": min_size,
+        "count": stats.count,
+        "total_bytes": stats.total_bytes,
+        "top_n": top_n,
+        "top": [{"path": format_path(e.path, root, relative), "size_bytes": e.size} for e in stats.top],
+    }
+
+
+def post_payload(url: str, payload: dict[str, Any], timeout: float, logger: logging.Logger) -> bool:
+    try:
+        import httpx
+    except ImportError:
+        logger.error("httpx モジュールが見つかりません。HTTP POST を実行できません。")
+        return False
+
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.post(url, json=payload)
+        logger.info("POST %s -> %d", url, resp.status_code)
+        if resp.status_code >= 400:
+            logger.warning("response body (truncated): %s", resp.text[:200])
+            return False
+        return True
+    except Exception as exc:
+        logger.error("HTTP POST エラー: %s", exc)
+        return False
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    logger = setup_logger(args.verbose)
+
+    directory_from_cli = args.directory is not None
+    provided = parse_provided_options(argv)
+
+    env_file: dict[str, str] = {}
+    if args.env_file is not None:
+        env_file = load_env_file(args.env_file, logger)
+
+    # Day19: env から config パスを先に解決しておく（configは最下位なので先に読む必要がある）
+    if args.config is None and "--config" not in provided:
+        v = get_env("DIRSCAN_CONFIG", env_file)
+        if v:
+            args.config = Path(v)
+
+    # Day19: まず config を適用（優先度は低い）
+    if args.config is not None:
+        cfg = load_config(args.config, logger)
+        apply_config(args, cfg, provided, logger)
+
+    # Day19: env を適用（configより優先、CLIより劣後）
+    apply_env(args, env_file, provided, logger, directory_from_cli)
+
+    # verbose が env/config で変わりうるので logger を組み直す
+    logger = setup_logger(args.verbose)
+
+    directory = args.directory if args.directory is not None else Path(".")
+    root: Path = directory.expanduser().resolve()
+
+    if not root.exists():
+        print(f"Error: 指定されたパスが存在しません: {root}", file=sys.stderr)
+        return 2
+    if not root.is_dir():
+        print(f"Error: 指定されたパスはディレクトリではありません: {root}", file=sys.stderr)
+        return 2
+    if args.top < 0:
+        print(f"Error: --top の値は0以上でなければなりません: {args.top}", file=sys.stderr)
+        return 2
+    if args.min_size < 0:
+        print(f"Error: --min-size の値は0以上でなければなりません: {args.min_size}", file=sys.stderr)
+        return 2
+    if args.timeout <= 0:
+        print(f"Error: --timeout の値は0より大きい必要があります: {args.timeout}", file=sys.stderr)
+        return 2
+
+    logger.info("scan start: root=%s mode=%s min_size=%d top=%d", root, args.mode, args.min_size, args.top)
+    entries = iter_entries(root, mode=args.mode, min_size=args.min_size, logger=logger)
+    stats = compute_stats(entries, top_n=args.top)
+    logger.info("scan done: count=%d total_bytes=%d", stats.count, stats.total_bytes)
+
+    payload: dict[str, Any] | None = None
+    if args.json or args.post or args.out is not None:
+        payload = build_json_payload(
+            root=root,
+            mode=args.mode,
+            min_size=args.min_size,
+            top_n=args.top,
+            stats=stats,
+            relative=args.relative,
+        )
+
+    if args.json and payload is not None:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+    if args.out is not None and payload is not None:
+        try:
+            out_path = args.out.expanduser().resolve()
+            out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            logger.info("payload written to %s", out_path)
+        except Exception as exc:
+            logger.error("failed to write payload to %s: %s", out_path, exc)
+            return 1
+
+    if args.post and payload is not None:
+        ok = post_payload(args.post, payload, timeout=args.timeout, logger=logger)
+        if not ok:
+            return 1
+
+    if args.json:
+        return 0
+
+    display_total = human_size(stats.total_bytes) if args.human else str(stats.total_bytes)
+    print(f"directory: {root}")
+    print(f"mode:      {args.mode}")
+    print(f"min-size:  {args.min_size}")
+    print(f"relative:  {args.relative}")
+    print(f"count:     {stats.count}")
+    print(f"total:     {display_total}")
+
+    if args.top > 0:
+        print(f"top:       {args.top}")
+        for e in stats.top:
+            size_str = human_size(e.size) if args.human else str(e.size)
+            print(f"{size_str}\t{format_path(e.path, root, args.relative)}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
