@@ -16,7 +16,13 @@ import logging
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Tuple, TypeAlias
+from typing import Any, Iterable, Iterator, Tuple
+
+# Python 3.8 互換: TypeAlias は 3.10+。3.8 では typing_extensions を使う。
+try:
+    from typing import TypeAlias  # Python 3.10+
+except ImportError:  # pragma: no cover
+    from typing_extensions import TypeAlias  # Python 3.8/3.9
 
 import toolkit
 

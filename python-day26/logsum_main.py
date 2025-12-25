@@ -1,15 +1,14 @@
 """
-Day23: エントリーポイント（薄いラッパー） - logsum
+Day26: logsum のエントリーポイント（薄いラッパー）
 
 狙い：
-- 実装本体(logsum.py)とCLI実行の入口を分離する
-- import しただけで集計が走らない（テスト/再利用がしやすい）
+- import される「実装本体」と、CLI実行の「入口」を分離する
+- テストは `logsum.py` を直接 import して行う（副作用の少ない形）
 """
 
 from __future__ import annotations
 
 import sys
-
 
 if __name__ == "__main__":
     from logsum import main

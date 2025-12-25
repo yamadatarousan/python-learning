@@ -1,10 +1,9 @@
 """
-Day23: logsum の最小テスト群。
+Day26: logsum のテスト
 
 狙い：
-- ログの「読み方（パース）」が壊れてないかを軽く押さえる
-- 集計（レベル件数 / TOPメッセージ）が想定どおりか確認する
-- --out でJSONファイルが書けること（副作用の確認）を押さえる
+- logsum 固有の仕様（format解析、集計、優先順位）を確認する
+- 共通I/O部品（toolkit）は既存テストで担保されている前提で、ここでは “使い方” に寄せる
 """
 
 from __future__ import annotations
@@ -12,70 +11,88 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 import logsum
+import toolkit
 
 
-def test_parse_level_and_message_bracket_style() -> None:
-    # テスト意図： "[INFO] hello" 形式を正しく分解できることを確認する
-    # 仕様：先頭が [LEVEL] なら LEVEL と本文に分かれる
-    level, msg = logsum.parse_level_and_message("[INFO] hello world")
-    assert level == "INFO"
-    assert msg == "hello world"
-
-
-def test_parse_level_and_message_dash_style() -> None:
-    # テスト意図： "... - INFO - hello" 形式を正しく分解できることを確認する
-    # 仕様：行中に "INFO - " があれば INFO と本文に分かれる（loggingの定番形）
-    level, msg = logsum.parse_level_and_message("2025-01-01 - app - INFO - started")
-    assert level == "INFO"
-    assert msg == "started"
-
-
-def test_parse_level_and_message_unknown_falls_back() -> None:
-    # テスト意図：パースできない行が来ても落ちずに UNKNOWN 扱いになることを確認する
-    # 仕様：UNKNOWN のときは「元の行」をメッセージとして残す
-    level, msg = logsum.parse_level_and_message("??? something weird")
-    assert level == "UNKNOWN"
-    assert msg == "??? something weird"
-
-
-def test_aggregate_counts_levels_and_top_messages() -> None:
-    # テスト意図：集計（レベル別件数 / TOPメッセージ）が想定どおりか確認する
-    # 仕様：
-    # - levelは INFO/ERROR/UNKNOWN などで数える
-    # - top_n > 0 のときは、同じメッセージが何回出たかをランキングできる
+def test_compute_log_stats_bracket_counts_levels_and_top_messages() -> None:
+    # テスト意図：bracket形式のレベル集計と top_messages が想定どおりか確認する
     lines = [
-        "[INFO] ok",
-        "[INFO] ok",
-        "2025-01-01 - app - ERROR - boom",
-        "nonsense line",
+        "[INFO] hello\n",
+        "[INFO] hello\n",
+        "[WARN] oh\n",
+        "broken line\n",
     ]
-    summary = logsum.aggregate(lines, top_n=2)
-    assert summary.lines == 4
-    assert summary.levels["INFO"] == 2
-    assert summary.levels["ERROR"] == 1
-    assert summary.levels["UNKNOWN"] == 1
-    assert summary.top_messages[0].message in {"ok", "boom", "nonsense line"}
-    assert sum(m.count for m in summary.top_messages) <= 4
+    logger = toolkit.setup_logger("test", False)
+    stats = logsum.compute_log_stats(lines, fmt="bracket", top_n=2, logger=logger)
+
+    assert stats.total_lines == 4
+    assert stats.by_level["INFO"] == 2
+    assert stats.by_level["WARN"] == 1
+    assert stats.by_level["UNKNOWN"] == 1
+    assert stats.top_messages[0].message == "hello"
+    assert stats.top_messages[0].count == 2
 
 
-def test_main_writes_out_json_file(tmp_path: Path) -> None:
-    # テスト意図： --out 指定で JSON ファイルが書けることを確認する（副作用の確認）
+def test_compute_log_stats_jsonl_parses_message_keys() -> None:
+    # テスト意図：jsonl形式で message/msg のどちらでも読めることを確認する
+    lines = [
+        '{"level":"info","message":"A"}\n',
+        '{"level":"info","msg":"B"}\n',
+        '{"level":"warn","message":"A"}\n',
+    ]
+    logger = toolkit.setup_logger("test", False)
+    stats = logsum.compute_log_stats(lines, fmt="jsonl", top_n=10, logger=logger)
+
+    assert stats.total_lines == 3
+    assert stats.by_level["INFO"] == 2
+    assert stats.by_level["WARN"] == 1
+
+    # A は2回、B は1回
+    top = {m.message: m.count for m in stats.top_messages}
+    assert top["A"] == 2
+    assert top["B"] == 1
+
+
+def test_main_writes_out_file_when_env_file_sets_json_and_out(tmp_path: Path) -> None:
+    # テスト意図：env-file で json/out を有効化すると out に保存されることを確認する
     # 仕様：
-    # - patternに一致するログを集計し、outにJSONを書き込む
-    root = tmp_path / "logs"
-    root.mkdir()
-    (root / "app.log").write_text("[INFO] ok\n[ERROR] boom\n", encoding="utf-8")
+    # - LOGSUM_JSON=true なら JSON を出力する（= payload が作られる）
+    # - LOGSUM_OUT があれば、そのパスに payload を書き込む（toolkit.write_json_file 経由）
+    log_path = tmp_path / "app.log"
+    log_path.write_text("[INFO] hello\n[WARN] oh\n", encoding="utf-8")
 
-    out_path = tmp_path / "report.json"
-    rc = logsum.main([str(root), "--pattern", "*.log", "--top", "1", "--out", str(out_path)])
+    out_path = tmp_path / "report.env.json"
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                f"LOGSUM_INPUT={log_path}",
+                "LOGSUM_FORMAT=bracket",
+                "LOGSUM_TOP=1",
+                "LOGSUM_JSON=true",
+                f"LOGSUM_OUT={out_path}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    rc = logsum.main(["--env-file", str(env_path)])
     assert rc == 0
     assert out_path.exists()
 
     data = json.loads(out_path.read_text(encoding="utf-8"))
-    assert data["directory"] == str(root.resolve())
-    assert data["pattern"] == "*.log"
-    assert data["files"] == 1
-    assert data["lines"] == 2
-    assert data["levels"]["INFO"] == 1
-    assert data["levels"]["ERROR"] == 1
+    assert data["format"] == "bracket"
+    assert data["top_n"] == 1
+    assert data["total_lines"] == 2
+
+
+def test_validate_args_rejects_missing_input_file(tmp_path: Path) -> None:
+    # テスト意図：存在しない入力ファイルを指定したら終了コード2になることを確認する
+    missing = tmp_path / "missing.log"
+    args = logsum.parse_args([str(missing)])
+    rc = logsum.validate_args(args, missing)
+    assert rc == 2
