@@ -1,5 +1,5 @@
 """
-Day24: dirscan を toolkit.py を使う形に整理した版
+Day25: dirscan を toolkit.py を使う形に整理した版（コメント整理つき）
 
 狙い：
 - 「小ツール共通のI/Oまわり（logger/.env/bool/POST/JSON保存）」は toolkit.py に寄せる
@@ -16,36 +16,17 @@ import logging
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Tuple
+from typing import Any, Iterable, Iterator, Tuple, TypeAlias
 
 import toolkit
 
-
-# -------------------------
-# 表示ユーティリティ（副作用なし）
-# -------------------------
-
-def human_size(size: int) -> str:
-    """バイト数を人間向け表記に変換する（例: 1536 -> 1.5KB）。"""
-    units = ["B", "KB", "MB", "GB", "TB", "PB"]
-    value = float(size)
-
-    for unit in units:
-        is_small_enough = value < 1024
-        is_last_unit = unit == units[-1]
-        if is_small_enough or is_last_unit:
-            if unit == "B":
-                return f"{int(value)}B"
-            return f"{value:.1f}{unit}"
-        value /= 1024
-
-    # 通常ここには到達しない（保険）
-    return f"{int(value)}{units[-1]}"
+LOGGER_NAME = "dirscan"
 
 
 # -------------------------
 # CLIパース（I/O境界：入力）
 # -------------------------
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """
@@ -132,6 +113,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 # 設定ファイル（JSON）（I/O境界：入力）
 # -------------------------
 
+
 def load_config(path: Path, logger: logging.Logger) -> dict[str, Any]:
     """
     JSON設定ファイルを読み込む。
@@ -194,6 +176,7 @@ def apply_config(args: argparse.Namespace, cfg: dict[str, Any], provided: set[st
 # -------------------------
 # env適用（I/O境界：入力）
 # -------------------------
+
 
 def apply_env(
     args: argparse.Namespace,
@@ -277,6 +260,7 @@ def apply_env(
 # データモデル（DTO）
 # -------------------------
 
+
 @dataclass(frozen=True)
 class Entry:
     """
@@ -286,6 +270,7 @@ class Entry:
     - 集計中に「途中で書き換わる」事故を防ぐ
     - テストで扱うときに前提が揺れない
     """
+
     path: Path
     size: int
 
@@ -299,6 +284,7 @@ class Stats:
     - 計算部分の戻り値が一つにまとまる
     - 出力形式（表示/JSON）と計算ロジックを分けやすい
     """
+
     count: int
     total_bytes: int
     top: list[Entry]
@@ -307,6 +293,7 @@ class Stats:
 # -------------------------
 # 走査・計算（コアロジック）
 # -------------------------
+
 
 def should_count(path: Path, mode: str) -> bool:
     """modeに応じて「件数/対象に含めるか」を決める。"""
@@ -352,6 +339,9 @@ def iter_entries(root: Path, mode: str, min_size: int, logger: logging.Logger) -
         yield Entry(path=path, size=size)
 
 
+HeapItem: TypeAlias = Tuple[int, str, Entry]
+
+
 def compute_stats(entries: Iterable[Entry], top_n: int) -> Stats:
     """
     計算部分（なるべく純粋関数っぽく）。
@@ -363,7 +353,7 @@ def compute_stats(entries: Iterable[Entry], top_n: int) -> Stats:
     """
     count = 0
     total_bytes = 0
-    heap: list[Tuple[int, str, Entry]] = []
+    heap: list[HeapItem] = []
 
     for e in entries:
         count += 1
@@ -373,7 +363,7 @@ def compute_stats(entries: Iterable[Entry], top_n: int) -> Stats:
             continue
 
         # tie-breaker を path で固定しておく（同サイズのときの表示ブレを減らす）
-        item = (e.size, str(e.path), e)
+        item: HeapItem = (e.size, str(e.path), e)
         if len(heap) < top_n:
             heapq.heappush(heap, item)
         else:
@@ -387,6 +377,7 @@ def compute_stats(entries: Iterable[Entry], top_n: int) -> Stats:
 # -------------------------
 # 出力（I/O境界：stdout / ファイル / HTTP）
 # -------------------------
+
 
 def build_json_payload(root: Path, mode: str, min_size: int, top_n: int, stats: Stats, relative: bool) -> dict[str, Any]:
     """
@@ -411,6 +402,7 @@ def build_json_payload(root: Path, mode: str, min_size: int, top_n: int, stats: 
 # 実行フロー組み立て（入口を薄くする）
 # -------------------------
 
+
 def resolve_effective_args(argv: list[str] | None) -> tuple[argparse.Namespace, logging.Logger]:
     """
     CLI/env/config を統合して「最終的に使う args」を確定する。
@@ -427,7 +419,7 @@ def resolve_effective_args(argv: list[str] | None) -> tuple[argparse.Namespace, 
     provided = toolkit.parse_provided_options(argv)
 
     # まずはCLIのverboseで暫定loggerを作る（env/configでverboseが変わったら作り直す）
-    logger = toolkit.setup_logger("dirscan", args.verbose)
+    logger = toolkit.setup_logger(LOGGER_NAME, args.verbose)
 
     # --env-file の読み込み（OS環境変数より優先されるのは get_env 側の仕様）
     env_file: dict[str, str] = {}
@@ -449,7 +441,7 @@ def resolve_effective_args(argv: list[str] | None) -> tuple[argparse.Namespace, 
     apply_env(args, env_file, provided, logger, directory_from_cli)
 
     # verbose が env/config で変わりうるので logger を組み直す（ログレベルが反映される）
-    logger = toolkit.setup_logger("dirscan", args.verbose)
+    logger = toolkit.setup_logger(LOGGER_NAME, args.verbose)
     return args, logger
 
 
@@ -537,7 +529,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # 人間向け表示（従来どおり）
-    display_total = human_size(stats.total_bytes) if args.human else str(stats.total_bytes)
+    display_total = toolkit.human_size(stats.total_bytes) if args.human else str(stats.total_bytes)
     print(f"directory: {root}")
     print(f"mode:      {args.mode}")
     print(f"min-size:  {args.min_size}")
@@ -548,7 +540,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.top > 0:
         print(f"top:       {args.top}")
         for e in stats.top:
-            size_str = human_size(e.size) if args.human else str(e.size)
+            size_str = toolkit.human_size(e.size) if args.human else str(e.size)
             print(f"{size_str}\t{format_path(e.path, root, args.relative)}")
 
     return 0

@@ -4,6 +4,7 @@ Day24: 小ツール共通の「I/Oまわり」部品集（toolkit）
 狙い：
 - いろんな小ツールで毎回出てくる「だいたい同じ処理」をまとめる
   例：logger構成、.env読み取り、bool変換、JSON保存、HTTP POST
+- ついでに「どのツールでも同じ意味で使える表示補助」もまとめる（例：人間向けサイズ表記）
 - 各ツール本体は「そのツール固有の処理」に集中できるようにする
 
 注意：
@@ -19,6 +20,30 @@ import os
 import sys
 from pathlib import Path
 from typing import Any
+
+
+def human_size(size: int) -> str:
+    """
+    バイト数を人間向け表記に変換する（例: 1536 -> 1.5KB）。
+
+    この関数の役割：
+    - 「数字を見ただけではピンとこないサイズ」を、ざっくり直感で読める形にする
+    - どのツールでも同じルールで使えるので toolkit 側に置く
+    """
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    value = float(size)
+
+    for unit in units:
+        is_small_enough = value < 1024
+        is_last_unit = unit == units[-1]
+        if is_small_enough or is_last_unit:
+            if unit == "B":
+                return f"{int(value)}B"
+            return f"{value:.1f}{unit}"
+        value /= 1024
+
+    # 通常ここには到達しない（保険）
+    return f"{int(value)}{units[-1]}"
 
 
 def parse_provided_options(argv: list[str] | None) -> set[str]:
