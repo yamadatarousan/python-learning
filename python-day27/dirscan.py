@@ -345,7 +345,10 @@ def iter_entries(root: Path, mode: str, min_size: int, logger: logging.Logger) -
         yield Entry(path=path, size=size)
 
 
-HeapItem: TypeAlias = Tuple[int, str, Entry]
+# Heapの要素（size / path文字列 / Entry）。
+# TypeAlias を使わず、代入で「この形のタプル」と示す。
+#（typing.TypeAlias は Python 3.8 だと ImportError になりやすい）
+HeapItem = Tuple[int, str, Entry]
 
 
 def compute_stats(entries: Iterable[Entry], top_n: int) -> Stats:
