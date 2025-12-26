@@ -1,333 +1,318 @@
-# python-learning
+# dirscan（Day29）
 
-LLMに毎回渡す固定プロンプト
+ディレクトリ配下を再帰的に走査して、**合計サイズ**と**サイズ上位N件**を表示する小さなCLIツールです。  
+必要なら **JSON出力** / **ファイル保存** / **HTTP POST** もできます。
 
-【前提】
-- 私は「30日間のPython学習カリキュラム」を進行中
-- 次は Day 14
-- 目的：Pythonの基礎理解と設計感覚の獲得
+- 実装本体: `dirscan.py`
+- 共通I/O部品: `toolkit.py`
+- エントリーポイント: `main.py`
+- テスト: `test_dirscan.py`
 
-以下は君が考えた当初の学習計画
-※注意：君のブレで当初の学習計画と実際の学習プロセスがズレている可能性がある
+---
 
-Python学習計画 30日（実務寄り・DTO/CLI中心）
-フェーズ1：書ける感覚を戻す（Day 1–7）
-目的：Pythonで手が動く安心感
-Day 1：環境確認・print・if・for
-Day 2：list / dict / set 基本操作
-Day 3：関数定義・引数・戻り値
-Day 4：Pathlibでファイル操作
-Day 5：例外処理（try/except）
-Day 6：簡単なCLI（argparse）
-Day 7：ミニ課題
-ディレクトリ内のファイル数・合計サイズを出す
+## できること
 
-フェーズ2：Pythonらしさに慣れる（Day 8–15）
-目的：コードを短く・安全に
-* Day 8：list/dict comprehension
-* Day 9：dataclass基礎
-* Day10：dataclass + sort / key
-* Day11：typing（list[str], Iterable）
-* Day12：標準ライブラリ探索（heapq, itertools）
-* Day13：ジェネレータ（yield）
-* Day14：ログ・stderr出力
-* Day15：ミニ課題
-    * 今回作った「大きいファイルTOP N」を書き直す
-  
-フェーズ3：実務感覚（Day 16–25）
-目的：現場で「使える」Python
-* Day16：仮想環境（venv）
-* Day17：requests / httpx でAPI叩く
-* Day18：JSON読み書き
-* Day19：設定ファイル（env / json）
-* Day20：テストの雰囲気（pytest触るだけ）
-* Day21：CLI構成整理
-* Day22–24：小ツール作成
-    * ログ集計 / API結果整形 / CSV処理
-* Day25：コード整理・コメント追加
+- 指定ディレクトリ以下を再帰走査（`Path.rglob("*")`）
+- 件数（count）と合計バイト（total_bytes）を集計
+- サイズが大きい順に上位N件を表示（`heapq`で上位N件だけ保持）
+- `--json` で JSON を stdout に出す（人間向け表示はしない）
+- `--out` で JSON をファイルに保存（stdoutは汚さない）
+- `--post` で JSON をHTTP POST（stdoutは汚さない）
+- `--env-file` で `.env` を読み、環境変数として扱う
 
-フェーズ4：仕上げ（Day 26–30）
-Day26–28：1ツール完成（雑でOK）
-Day29：READMEを書く
-Day30：振り返り
-「Pythonで出来ること」棚卸し
+---
 
-day13までの成果物は以下
+## 前提
 
-"""
-Day13: ミニCLIツール（ディレクトリ走査）— 出力パスを相対/絶対で切替（Day12 FIX版の続き）
+- Python 3.8+（3.8でも動くように調整済み）
+- HTTP POST を使う場合は `httpx` が必要
 
-このプログラムは、指定ディレクトリ以下を再帰的に走査して集計するCLIツール。
+---
 
-Day13のポイント：
-- “計算する部分”（entries -> 集計結果）をなるべく純粋関数っぽくする
-  * なるべく引数だけで結果が決まる形にして、printやファイル走査と分離する
-- I/O（走査・表示・JSON出力）は外側に寄せる
-- 出力するパスを --relative で「rootからの相対パス」に切り替えられるようにする
+## インストール（最小）
 
-使い方:
-    python main.py [directory] [--mode file|all] [--min-size N] [--top N] [--human] [--json] [--verbose] [--relative]
-"""
+このリポジトリ内で実行する想定です。
 
-from __future__ import annotations
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+```
 
-import argparse
-import heapq
-import json
-import sys
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+HTTP POST（`--post`）を使うなら:
 
+```bash
+python -m pip install httpx
+```
 
-def human_size(size: int) -> str:
-    """バイト数を人間向けの単位に変換する（表示専用）。"""
-    units = ["B", "KB", "MB", "GB", "TB", "PB"]
-    value = float(size)
+---
 
-    for unit in units:
-        is_small_enough = value < 1024
-        is_last_unit = unit == units[-1]
+## 実行方法
 
-        if is_small_enough or is_last_unit:
-            if unit == "B":
-                return f"{int(value)}B"
-            return f"{value:.1f}{unit}"
+### 1) ふつうに人間向け表示
 
-        value /= 1024
+```bash
+python main.py .
+```
 
-    return f"{int(value)}{units[-1]}"
+例（イメージ）:
 
+```
+directory: /abs/path/to/project
+mode:      file
+min-size:  0
+relative:  False
+count:     123
+total:     456789
+top:       10
+1200	/abs/path/to/project/a.bin
+...
+```
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """
-    CLI引数を定義して解析する。
-    - directory: 省略可能な位置引数（デフォルトはカレント）
-    - --mode: 何をcount対象にするか（file/all）
-    - --min-size: 小さいものを除外（バイト）
-    - --top: サイズが大きい上位N件を表示する
-    - --human / --verbose: 表示のスイッチ
-    - --json: JSONで出力する（stdoutをJSON専用にする）
-    - --relative: 出力パスをrootからの相対パスにする（Day13）
-    """
-    parser = argparse.ArgumentParser(
-        description="Scan a directory recursively, count entries, sum sizes, and optionally show top N by size."
-    )
+### 2) サイズを人間向け表示にする
 
-    parser.add_argument(
-        "directory",
-        nargs="?",
-        default=Path("."),
-        type=Path,  # 引数ありでも常に Path になる（以前踏んだ地雷ポイント）
-        help="Directory to scan (default: current directory).",
-    )
+```bash
+python main.py . --human
+```
 
-    parser.add_argument(
-        "--mode",
-        choices=["file", "all"],
-        default="file",
-        help="What to count: file=regular files only (default), all=all non-directory entries (e.g., sockets)",
-    )
+### 3) 上位N件を変える
 
-    parser.add_argument(
-        "--top",
-        type=int,
-        default=0,
-        help="Show top N largest entries by st_size (0 = do not show).",
-    )
+```bash
+python main.py . --top 5
+```
 
-    parser.add_argument(
-        "--min-size",
-        type=int,
-        default=0,
-        help="Ignore entries smaller than N bytes (default: 0).",
-    )
+`--top 0` にすると上位表示を無効化します（集計はする）。
 
-    parser.add_argument(
-        "--human",
-        action="store_true",
-        help="Show sizes in a human-readable format.",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print verbose messages (e.g., skipped paths).",
-    )
+### 4) 相対パス表示にする
 
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Output result as JSON.",
-    )
+```bash
+python main.py . --relative
+```
 
-    parser.add_argument(
-        "--relative",
-        action="store_true",
-        help="Output paths as relative to the root directory when possible.",
-    )
+### 5) JSONをstdoutに出す
 
-    return parser.parse_args(argv)
+```bash
+python main.py . --json
+```
 
+`--json` を付けると人間向け表示はしません（stdoutはJSON専用）。
 
-def should_count(path: Path, mode: str) -> bool:
-    """modeに応じて「このpathをcount対象に含めるか」を判断する。"""
-    if mode == "file":
-        return path.is_file()
-    if mode == "all":
-        return not path.is_dir()
-    return False
+### 6) JSONをファイルに保存する（stdoutは汚さない）
 
+```bash
+python main.py . --out report.json
+```
 
-@dataclass(frozen=True)
-class Entry:
-    """走査結果の「パス + サイズ」を持つDTO。"""
-    path: Path
-    size: int
+### 7) JSONをHTTP POSTする（stdoutは汚さない）
 
+```bash
+python main.py . --post https://httpbin.org/post --timeout 10
+```
 
-@dataclass(frozen=True)
-class Stats:
-    """
-    Day12: 集計結果（計算の出力）をひとまとめにするDTO。
-    """
-    count: int
-    total_bytes: int
-    top: list[Entry]
+---
 
+## オプション一覧
 
-def format_path(path: Path, root: Path, relative: bool) -> str:
-    """
-    Day13: 出力用のパス文字列を作る。
-    - relative=True のとき、可能なら root からの相対パスにする
-    - 失敗したら（別ドライブ等）絶対パスのまま
-    """
-    if not relative:
-        return str(path)
-    try:
-        return str(path.relative_to(root))
-    except ValueError:
-        return str(path)
+`dirscan.py` の `parse_args()` で定義している項目です。
 
+- `directory`（位置引数・省略可）  
+  走査対象ディレクトリ。省略時は `.`（カレント）
 
-def iter_entries(root: Path, mode: str, min_size: int, verbose: bool) -> list[Entry]:
-    """
-    root以下を走査してEntry一覧を返す（I/O側）。
-    - statが取れないものはスキップ（verboseなら理由をstderrに出す）
-    - min_size 未満は除外
-    """
-    entries: list[Entry] = []
+- `--mode {file,all}`  
+  - `file`: 通常ファイルのみ  
+  - `all`: ディレクトリ以外すべて（ファイル/シンボリックリンク等を含む）
 
-    for path in root.rglob("*"):
-        if not should_count(path, mode):
-            continue
+- `--top N`  
+  サイズ上位N件を表示（デフォルト 10）。`0` で無効。
 
-        try:
-            size = path.stat().st_size
-        except OSError as exc:
-            if verbose:
-                print(f"[skip] {path}: {exc}", file=sys.stderr)
-            continue
+- `--min-size BYTES`  
+  指定サイズ（バイト）未満は集計対象から除外
 
-        if size < min_size:
-            continue
+- `--relative`  
+  出力するパスを `root` からの相対パスにする（できる範囲で）
 
-        entries.append(Entry(path=path, size=size))
+- `--human`  
+  サイズを `1.5KB` のように表示する
 
-    return entries
+- `--verbose`  
+  走査中の詳細ログを stderr に出す（stdoutは汚さない）
 
+- `--json`  
+  集計結果を JSON で stdout に出す（人間向け表示はしない）
 
-def find_top_n(entries: list[Entry], n: int) -> list[Entry]:
-    """サイズが大きい上位N件を返す。"""
-    if n <= 0:
-        return []
+- `--post URL`  
+  JSONをPOSTするURL。空文字ならPOSTしない
 
-    top = heapq.nlargest(n, entries, key=lambda e: e.size)
-    top.sort(key=lambda e: (-e.size, str(e.path)))  # 表示安定化
-    return top
+- `--timeout SECONDS`  
+  POST時のタイムアウト秒（デフォルト 10.0）
 
+- `--config PATH`  
+  JSON config ファイル。CLIが最優先で、未指定の項目だけを補完する
 
-def compute_stats(entries: list[Entry], top_n: int) -> Stats:
-    """
-    Day12: 計算部分（なるべく純粋関数っぽく）
-    入力：entries（既に走査済みのデータ）
-    出力：Stats（count/total/top）
-    """
-    count = len(entries)
-    total_bytes = sum(e.size for e in entries)
-    top_entries = find_top_n(entries, top_n)
-    return Stats(count=count, total_bytes=total_bytes, top=top_entries)
+- `--out PATH`  
+  JSON payload をファイルに保存する
 
+- `--env-file PATH`  
+  `.env` を読み込んで「環境変数として」扱う
 
-def build_json_payload(root: Path, mode: str, min_size: int, top_n: int, stats: Stats, relative: bool) -> dict[str, Any]:
-    """
-    Day12: JSON用の辞書を組み立てる（表示形式の責務）。
-    """
-    return {
-        "directory": str(root),
-        "mode": mode,
-        "min_size": min_size,
-        "count": stats.count,
-        "total_bytes": stats.total_bytes,
-        "top_n": top_n,
-        "top": [{"path": format_path(e.path, root, relative), "size_bytes": e.size} for e in stats.top],
-    }
+---
 
+## 設定の優先順位（超重要）
 
-def main(argv: list[str] | None = None) -> int:
-    """
-    CLIのエントリーポイント。
-    - 引数解析
-    - 入力検証
-    - I/O（走査）
-    - 計算（集計）
-    - 出力（テキスト or JSON）
-    - 終了コード（0=成功, 2=入力エラー）
-    """
-    args = parse_args(argv)
-    root: Path = args.directory.expanduser().resolve()
+最終的に使う値は、この順で強いです。
 
-    if not root.exists():
-        print(f"Directory does not exist: {root}", file=sys.stderr)
-        return 2
-    if not root.is_dir():
-        print(f"Not a directory: {root}", file=sys.stderr)
-        return 2
-    if args.top < 0:
-        print("--top must be >= 0", file=sys.stderr)
-        return 2
-    if args.min_size < 0:
-        print("--min-size must be >= 0", file=sys.stderr)
-        return 2
+**CLI > env > config**
 
-    # I/O（走査）：rootからentriesを作る
-    entries = iter_entries(root, mode=args.mode, min_size=args.min_size, verbose=args.verbose)
+- **CLI**: ユーザーがコマンドラインで指定したもの（最強）
+- **env**: OS環境変数 + `--env-file` で読み込んだ `.env`
+- **config**: JSON設定ファイル（最弱）
 
-    # 計算（Day12）：entriesから集計結果を作る
-    stats = compute_stats(entries, top_n=args.top)
+`resolve_effective_args()` の中で、この順に適用しています。
 
-    # JSON出力（stdoutはJSON専用にする）
-    if args.json:
-        payload = build_json_payload(root, args.mode, args.min_size, args.top, stats, args.relative)
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-        return 0
+### `.env` が必ず勝つルール
 
-    # 人間向け表示
-    display_total = human_size(stats.total_bytes) if args.human else str(stats.total_bytes)
-    print(f"directory: {root}")
-    print(f"mode:      {args.mode}")
-    print(f"min-size:  {args.min_size}")
-    print(f"relative:  {args.relative}")
-    print(f"count:     {stats.count}")
-    print(f"total:     {display_total}")
+`toolkit.get_env()` は、環境変数取得の優先順位を
 
-    if args.top > 0:
-        print(f"top:       {args.top}")
-        for e in stats.top:
-            size_str = human_size(e.size) if args.human else str(e.size)
-            print(f"{size_str}\t{format_path(e.path, root, args.relative)}")
+**env_file（.env） > OS環境変数**
 
-    return 0
+にしています。  
+「`--env-file` を指定したら `.env` の値を必ず採用したい」要件のためです。
 
+---
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+## config（JSON）例
+
+`config.json` の例:
+
+```json
+{
+  "directory": "/tmp",
+  "mode": "file",
+  "top": 10,
+  "min_size": 1024,
+  "relative": true,
+  "human": true,
+  "json": false,
+  "verbose": false,
+  "timeout": 10.0,
+  "post": "",
+  "out": ""
+}
+```
+
+ポイント:
+
+- config は「未指定の項目を埋める」目的で使います  
+  例: `--top 3` をCLIで指定したら、configの `top` は無視されます
+
+---
+
+## `.env` 例
+
+`.env` の例:
+
+```env
+# 走査対象
+DIRSCAN_DIRECTORY=/tmp
+
+# 上位件数
+DIRSCAN_TOP=5
+
+# JSONをstdoutに出す
+DIRSCAN_JSON=true
+
+# JSONをファイル保存
+DIRSCAN_OUT=report.env.json
+```
+
+`.env` のパースは `toolkit.load_env_file()` がやっています（標準ライブラリのみ）。
+
+---
+
+## JSONの形（payload）
+
+`--json` / `--out` / `--post` のどれかを使うと、内部で payload を作ります。  
+キーは `dirscan.build_json_payload()` で決めています（dirscan固有仕様）。
+
+例（イメージ）:
+
+```json
+{
+  "directory": "/abs/path/to/scan",
+  "mode": "file",
+  "min_size": 0,
+  "count": 123,
+  "total_bytes": 456789,
+  "top_n": 10,
+  "top": [
+    {"path": "a/b.txt", "size_bytes": 2048}
+  ]
+}
+```
+
+---
+
+## stdout / stderr の使い分け
+
+- **stdout**: 結果の出力（人間向け or JSON）
+- **stderr**: 進捗ログや警告、失敗（logger）
+
+この使い分けをすると:
+
+- `--json` で stdout を JSON だけにできる
+- パイプ処理（`| jq` など）を邪魔しない
+
+---
+
+## テストの実行
+
+```bash
+python -m pip install -U pytest
+pytest -q
+```
+
+テストは `test_dirscan.py` にまとまっています。  
+ポイントは次の2つです。
+
+- `toolkit` の共通関数は `toolkit` を直接テストする
+- `dirscan` 側は「dirscan固有の仕様」に寄せてテストする
+
+---
+
+## コード構成メモ（設計の意図）
+
+### `main.py` を薄くする理由
+
+- `dirscan.py` を import してテストしやすくする
+- 実装本体と「CLI起動の入口」を分ける  
+  （import時に副作用を出しにくくする）
+
+### `toolkit.py` に寄せるもの / 寄せないもの
+
+- 寄せる（どのツールでも同じ意味で使える）  
+  例: logger構成、`.env`読み取り、bool変換、JSON保存、HTTP POST、サイズ表示など
+
+- 寄せない（ツール固有の仕様）  
+  例: 引数名、環境変数名の命名、configキー名、payload構造、優先順位の細かい例外
+
+---
+
+## ありがちな使い方（例）
+
+### 「調べたいディレクトリを `.env` に固定して、毎回コマンドを短くする」
+
+```bash
+python main.py --env-file .env --json | jq .
+```
+
+### 「レポートをファイルに保存する」
+
+```bash
+python main.py /var/log --top 50 --out report.json
+```
+
+---
+
+## ライセンス
+
+学習用サンプル（30日カリキュラム）として作成。
