@@ -1,22 +1,26 @@
 """
-Day27: logsum（ログ要約ツール）
+Day28: ログ集計ツール（logsum）
 
 狙い：
-- 2つ目の小ツールを作って、toolkit の “共通処理” を実際に使い回す感覚を掴む
-- 「I/Oの入口（CLI/env/config）」と「中身（集計）」と「出口（stdout/file/http）」を分けて読める形にする
+- 2つ目の小ツールを作って「共通処理(toolkit) + ツール固有処理」の分け方を固める
+- 設定の優先順位（CLI > env > config）を、dirscan と同じノリで使い回せる形にする
 
 このツールがやること（ざっくり）：
-- ログ行を読み込む（ファイル or stdin）
-- 行頭の [INFO] みたいな形式、または JSONL を解釈して level を取り出す
-- level ごとの件数と、よく出る message 上位N件を出す
+- ログファイル（または標準入力）を1行ずつ読む
+- 1行が `[INFO] message` みたいな形なら、level=INFO として数える
+- levelごとの件数と、よく出る message の TOP N を出す
+- 必要なら JSON を stdout / ファイル保存 / HTTP POST できる（toolkit を利用）
 """
 
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
 import logging
+import re
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Tuple
@@ -35,35 +39,49 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """
     CLI引数を定義して、解析結果（args）を返す。
 
-    ここでやるのは「logsumの引数の並び（仕様）」を決めることだけ。
-    env/config の優先順位や補完は resolve_effective_args でやる。
+    ここでは「logsum が受け取る項目（仕様）」だけを列挙する。
+    env/configの優先順位や補完は別関数（resolve_effective_args）でやる。
     """
-    parser = argparse.ArgumentParser(description="Summarize logs by level and frequent messages.")
+    parser = argparse.ArgumentParser(description="Summarize log lines (count by level, top messages).")
 
     parser.add_argument(
         "path",
         nargs="?",
         default=None,  # config/envで上書きできるように「未指定(None)」を区別する
         type=Path,
-        help="入力ログファイル（省略時はstdin）",
+        help="ログファイルのパス（省略時はstdin）。 '-' でもstdin扱い。",
     )
 
     parser.add_argument(
-        "--format",
-        choices=["bracket", "jsonl"],
-        default="bracket",
-        help="入力の形式（bracket: [INFO] msg 形式 / jsonl: 1行1JSON）",
+        "--level",
+        type=str,
+        default="",
+        help="このレベルだけ集計する（例: INFO）。空なら全部。",
     )
 
     parser.add_argument(
         "--top",
         type=int,
-        default=10,
-        help="よく出る message 上位N件を表示する（default: 10）。0なら表示しない。",
+        default=5,
+        help="よく出る message の上位N件（default: 5）。0なら出さない。",
     )
 
     parser.add_argument("--json", action="store_true", help="集計結果をJSON形式で出力する")
-    parser.add_argument("--verbose", action="store_true", help="処理中の詳細ログをstderrに出す")
+    parser.add_argument("--verbose", action="store_true", help="処理中の詳細ログを表示する")
+
+    parser.add_argument(
+        "--post",
+        type=str,
+        default="",
+        help="集計結果のJSONをPOSTするURLを指定する（指定しない場合はPOSTしない）",
+    )
+
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="HTTP POSTのタイムアウト秒数（デフォルト: 10.0秒）",
+    )
 
     parser.add_argument(
         "--config",
@@ -77,18 +95,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Write the JSON payload to a file (e.g., report.json).",
     )
-    parser.add_argument(
-        "--post",
-        type=str,
-        default="",
-        help="集計結果のJSONをPOSTするURLを指定する（指定しない場合はPOSTしない）",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=10.0,
-        help="HTTP POSTのタイムアウト秒数（デフォルト: 10.0秒）",
-    )
+
     parser.add_argument(
         "--env-file",
         type=Path,
@@ -109,7 +116,7 @@ def load_config(path: Path, logger: logging.Logger) -> dict[str, Any]:
     JSON設定ファイルを読み込む。
 
     期待する例：
-      {"path": "app.log", "format": "bracket", "top": 20, "json": true}
+      {"path": "app.log", "level": "INFO", "top": 10, "json": true}
     """
     try:
         text = path.read_text(encoding="utf-8")
@@ -129,7 +136,7 @@ def apply_config(args: argparse.Namespace, cfg: dict[str, Any], provided: set[st
 
     ここでの責務：
     - 「未指定の項目だけ」を埋める（provided に入っているものは上書きしない）
-    - キー名（path/format/top/json...）は logsum 固有の仕様なのでここに残す
+    - どのキー名を使うか（path / level など）は logsum 固有の仕様なのでここに残す
     """
 
     def has(name: str) -> bool:
@@ -139,8 +146,8 @@ def apply_config(args: argparse.Namespace, cfg: dict[str, Any], provided: set[st
     if args.path is None and has("path"):
         args.path = Path(str(cfg["path"]))
 
-    if "--format" not in provided and has("format"):
-        args.format = str(cfg["format"])
+    if "--level" not in provided and has("level"):
+        args.level = str(cfg["level"])
     if "--top" not in provided and has("top"):
         args.top = int(cfg["top"])
     if "--timeout" not in provided and has("timeout"):
@@ -150,7 +157,7 @@ def apply_config(args: argparse.Namespace, cfg: dict[str, Any], provided: set[st
     if "--out" not in provided and has("out"):
         args.out = Path(str(cfg["out"]))
 
-    # store_true フラグ類は CLI未指定なら config を反映してよい
+    # store_true のフラグ類は、CLI未指定なら config を反映してよい
     if "--json" not in provided and has("json"):
         args.json = bool(cfg["json"])
     if "--verbose" not in provided and has("verbose"):
@@ -179,7 +186,7 @@ def apply_env(
     - path（位置引数）は「CLIで渡されたかどうか」を別扱いして上書き事故を防ぐ
 
     対応する環境変数名（logsum 固有の“名前”なのでここに残す）：
-      LOGSUM_PATH, LOGSUM_FORMAT, LOGSUM_TOP,
+      LOGSUM_PATH, LOGSUM_LEVEL, LOGSUM_TOP,
       LOGSUM_JSON, LOGSUM_VERBOSE,
       LOGSUM_POST, LOGSUM_TIMEOUT, LOGSUM_OUT, LOGSUM_CONFIG
     """
@@ -195,10 +202,10 @@ def apply_env(
         if v:
             args.path = Path(v)
 
-    if "--format" not in provided:
-        v = toolkit.get_env("LOGSUM_FORMAT", env_file)
-        if v:
-            args.format = v
+    if "--level" not in provided:
+        v = toolkit.get_env("LOGSUM_LEVEL", env_file)
+        if v is not None and v != "":
+            args.level = v
     if "--top" not in provided:
         v = toolkit.get_env("LOGSUM_TOP", env_file)
         if v:
@@ -233,132 +240,115 @@ def apply_env(
 # -------------------------
 
 
-@dataclass(frozen=True)
-class LogEvent:
+@dataclass
+class Record:
     """
-    1行から取り出した “最低限の情報” のDTO。
+    1行ぶんの「解釈結果」DTO（level + message）。
 
-    このツールの都合：
-    - 「level と message が取れれば集計できる」
-    - 元の行がどんな形式でも、ここに寄せれば下流が単純になる
+    ここをDTOにする狙い：
+    - 行の解釈（parse_line）と、集計（compute_stats）を切り分けやすくする
+    - テストで「この行はどう解釈されるべきか」を確認しやすい
     """
 
     level: str
     message: str
 
 
-@dataclass(frozen=True)
-class Summary:
+@dataclass
+class Stats:
     """
-    集計結果のDTO。
+    集計結果DTO。
 
-    ここをDTOにしておく狙い：
-    - 集計ロジック（compute_summary）の戻り値を1つにまとめる
-    - 表示（print/JSON）側が “何を持っているか” を読みやすくする
+    - total_lines: 集計対象にした行数
+    - level_counts: level別の件数
+    - top_messages: よく出る message の上位（(count, message) の配列）
     """
 
     total_lines: int
-    by_level: dict[str, int]
-    top_messages: list[Tuple[str, int]]  # (message, count)
+    level_counts: dict[str, int]
+    top_messages: list[Tuple[int, str]]
 
 
 # -------------------------
-# パース・集計（コアロジック）
+# 走査・計算（コアロジック）
 # -------------------------
 
 
-def parse_bracket_line(line: str) -> LogEvent:
+_BRACKET_RE = re.compile(r"^\[(?P<level>[A-Za-z]+)\]\s*(?P<msg>.*)$")
+_COLON_RE = re.compile(r"^(?P<level>[A-Za-z]+)\s*:\s*(?P<msg>.*)$")
+
+
+def parse_line(line: str) -> Record | None:
     """
-    [INFO] hello みたいな形式を想定して LogEvent を作る。
+    1行を (level, message) に分解する。
 
-    ルール（ゆるめ）：
-    - 行頭が "[" で、"]" が見つかれば level とする
-    - それ以外は level=UNKNOWN 扱い
+    対応する形：
+    - `[INFO] something`
+    - `INFO: something`
+
+    それ以外は level=UNKNOWN として扱う（完全に捨てるより「数えた」ほうが原因調査に役立つ）。
+    空行は None（集計対象外）にする。
     """
     s = line.strip("\n")
-    if s.startswith("[") and "]" in s:
-        close = s.find("]")
-        level = s[1:close].strip() or "UNKNOWN"
-        msg = s[close + 1 :].lstrip()
-        return LogEvent(level=level, message=msg)
-    return LogEvent(level="UNKNOWN", message=s.strip())
-
-
-def parse_jsonl_line(line: str, logger: logging.Logger) -> LogEvent | None:
-    """
-    JSONL（1行1JSON）を想定して LogEvent を作る。
-
-    期待する例：
-      {"level": "INFO", "message": "hello"}
-
-    壊れている行は None を返してスキップする（落とさない）。
-    """
-    s = line.strip()
-    if not s:
+    if s.strip() == "":
         return None
-    try:
-        obj = json.loads(s)
-    except Exception as exc:
-        logger.info("[skip] json parse failed: %s (%s)", s[:200], exc)
-        return None
-    if not isinstance(obj, dict):
-        logger.info("[skip] json must be object: %s", s[:200])
-        return None
-    level = str(obj.get("level", "UNKNOWN"))
-    message = str(obj.get("message", ""))
-    return LogEvent(level=level, message=message)
+
+    m = _BRACKET_RE.match(s.strip())
+    if m:
+        return Record(level=m.group("level").upper(), message=m.group("msg").strip())
+
+    m = _COLON_RE.match(s.strip())
+    if m:
+        return Record(level=m.group("level").upper(), message=m.group("msg").strip())
+
+    return Record(level="UNKNOWN", message=s.strip())
 
 
-def iter_events(lines: Iterable[str], fmt: str, logger: logging.Logger) -> Iterator[LogEvent]:
+def iter_records_from_text(lines: Iterable[str]) -> Iterator[Record]:
     """
-    入力の行（文字列）を LogEvent に変換して流す。
+    テキスト行（Iterable[str]）から Record を順次yieldする。
 
-    ここを iterator にする理由：
-    - 入口（読み込み）と中身（集計）をつなぐ “変換レイヤ” を分けたい
-    - 後で形式が増えても、ここだけ触れば済む
+    狙い：
+    - ファイルでもstdinでも「行の列」にしてしまえば同じ処理で流せる
+    - list化しない（大きいログでもメモリを食いにくい）
     """
-    if fmt == "bracket":
-        for line in lines:
-            yield parse_bracket_line(line)
-        return
-    if fmt == "jsonl":
-        for line in lines:
-            ev = parse_jsonl_line(line, logger)
-            if ev is None:
-                continue
-            yield ev
-        return
-
-    # ここには通常来ない（保険）
     for line in lines:
-        yield LogEvent(level="UNKNOWN", message=line.strip())
+        rec = parse_line(line)
+        if rec is None:
+            continue
+        yield rec
 
 
-def compute_summary(events: Iterable[LogEvent], top_n: int) -> Summary:
+def compute_stats(records: Iterable[Record], level_filter: str, top_n: int) -> Stats:
     """
-    LogEvent を集計して Summary を返す。
+    集計をする（なるべく純粋関数っぽく）。
 
-    仕様として守りたいこと：
-    - total_lines: 何行（イベント）処理したか
-    - by_level: levelごとの件数
-    - top_messages: messageの出現回数 上位N件（top_n<=0 なら空）
+    - level_filter が指定されているなら、そのlevelだけ数える（例: INFO）
+    - top_n は message の頻出上位。0なら出さない。
     """
+    level_filter_norm = level_filter.strip().upper()
+
+    level_counter: Counter[str] = Counter()
+    msg_counter: Counter[str] = Counter()
     total = 0
-    by_level: dict[str, int] = {}
-    msg_count: dict[str, int] = {}
 
-    for ev in events:
+    for r in records:
+        if level_filter_norm and r.level != level_filter_norm:
+            continue
+
         total += 1
-        by_level[ev.level] = by_level.get(ev.level, 0) + 1
-        if top_n > 0:
-            msg_count[ev.message] = msg_count.get(ev.message, 0) + 1
+        level_counter[r.level] += 1
+        msg_counter[r.message] += 1
 
-    top_messages: list[Tuple[str, int]] = []
-    if top_n > 0 and msg_count:
-        items = sorted(msg_count.items(), key=lambda t: (-t[1], t[0]))
-        top_messages = items[:top_n]
+    top_messages: list[Tuple[int, str]] = []
+    if top_n > 0 and msg_counter:
+        # (count, message) を作って nlargest。tie は message の辞書順で安定させる。
+        items: list[Tuple[int, str]] = [(c, m) for m, c in msg_counter.items()]
+        top_messages = heapq.nlargest(top_n, items, key=lambda t: (t[0], -len(t[1]), t[1]))
+        # 表示は count desc, message asc に寄せる（見た目が安定する）
+        top_messages = sorted(top_messages, key=lambda t: (-t[0], t[1]))
 
-    return Summary(total_lines=total, by_level=by_level, top_messages=top_messages)
+    return Stats(total_lines=total, level_counts=dict(level_counter), top_messages=top_messages)
 
 
 # -------------------------
@@ -366,7 +356,7 @@ def compute_summary(events: Iterable[LogEvent], top_n: int) -> Summary:
 # -------------------------
 
 
-def build_json_payload(source: str, fmt: str, top_n: int, summary: Summary) -> dict[str, Any]:
+def build_json_payload(path: str, level: str, top_n: int, stats: Stats) -> dict[str, Any]:
     """
     JSON用の辞書を組み立てる（表示形式の責務）。
 
@@ -375,12 +365,12 @@ def build_json_payload(source: str, fmt: str, top_n: int, summary: Summary) -> d
     - なので toolkit ではなく logsum 側が持つ
     """
     return {
-        "source": source,
-        "format": fmt,
+        "path": path,
+        "level": level,
         "top_n": top_n,
-        "total_lines": summary.total_lines,
-        "by_level": summary.by_level,
-        "top_messages": [{"message": m, "count": c} for (m, c) in summary.top_messages],
+        "total_lines": stats.total_lines,
+        "levels": [{"level": k, "count": v} for k, v in sorted(stats.level_counts.items(), key=lambda t: (-t[1], t[0]))],
+        "top_messages": [{"count": c, "message": m} for c, m in stats.top_messages],
     }
 
 
@@ -445,32 +435,37 @@ def validate_args(args: argparse.Namespace) -> int:
     if args.timeout <= 0:
         print(f"Error: --timeout の値は0より大きい必要があります: {args.timeout}", file=sys.stderr)
         return 2
-    if args.path is not None:
-        if not args.path.exists():
-            print(f"Error: 指定されたパスが存在しません: {args.path}", file=sys.stderr)
-            return 2
-        if not args.path.is_file():
-            print(f"Error: 指定されたパスはファイルではありません: {args.path}", file=sys.stderr)
-            return 2
+
+    # stdin の場合は存在チェックしない
+    if args.path is None:
+        return 0
+    if str(args.path) == "-":
+        return 0
+
+    p: Path = args.path.expanduser()
+    if not p.exists():
+        print(f"Error: 指定されたパスが存在しません: {p}", file=sys.stderr)
+        return 2
+    if not p.is_file():
+        print(f"Error: 指定されたパスはファイルではありません: {p}", file=sys.stderr)
+        return 2
     return 0
 
 
-def iter_input_lines(path: Path | None) -> Iterator[str]:
+def _open_lines(path: Path | None) -> tuple[str, Iterable[str]]:
     """
-    入力行を1行ずつ返す。
+    入力を「行の列」にする。
 
-    仕様として守りたいこと：
-    - path があればファイルから読む
-    - path がなければ stdin から読む
-    - encoding の問題で落ちないように errors="replace" を使う
+    返り値：
+    - 表示用の path 文字列（stdinなら "-"）
+    - 行の Iterable[str]
     """
     if path is None:
-        for line in sys.stdin:
-            yield line
-        return
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            yield line
+        return "-", sys.stdin
+    if str(path) == "-":
+        return "-", sys.stdin
+    p = path.expanduser()
+    return str(p), p.read_text(encoding="utf-8", errors="replace").splitlines(True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -480,7 +475,7 @@ def main(argv: list[str] | None = None) -> int:
     意図：
     - resolve_effective_args（設定解決）
     - validate_args（入力検証）
-    - parse/compute（実処理）
+    - read/compute（実処理）
     - output（副作用）
     を順に並べて、「責務の境界」が読める形にする。
     """
@@ -490,19 +485,17 @@ def main(argv: list[str] | None = None) -> int:
     if rc != 0:
         return rc
 
-    source = str(args.path.expanduser().resolve()) if args.path is not None else "<stdin>"
-    logger.info("logsum start: source=%s format=%s top=%d", source, args.format, args.top)
+    display_path, lines = _open_lines(args.path)
+    logger.info("read start: path=%s level=%s top=%d", display_path, args.level, args.top)
 
-    lines = iter_input_lines(args.path)
-    events = iter_events(lines, fmt=args.format, logger=logger)
-    summary = compute_summary(events, top_n=args.top)
-
-    logger.info("logsum done: total_lines=%d", summary.total_lines)
+    records = iter_records_from_text(lines)
+    stats = compute_stats(records, level_filter=args.level, top_n=args.top)
+    logger.info("read done: total_lines=%d", stats.total_lines)
 
     # payloadは --json / --post / --out のどれかで必要
     payload: dict[str, Any] | None = None
     if args.json or args.post or args.out is not None:
-        payload = build_json_payload(source=source, fmt=args.format, top_n=args.top, summary=summary)
+        payload = build_json_payload(path=display_path, level=args.level, top_n=args.top, stats=stats)
 
     # --json: stdoutはJSON専用
     if args.json and payload is not None:
@@ -525,16 +518,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # 人間向け表示
-    print(f"source:     {source}")
-    print(f"format:     {args.format}")
-    print(f"total:      {summary.total_lines}")
-    print("by_level:")
-    for level, count in sorted(summary.by_level.items(), key=lambda t: (-t[1], t[0])):
-        print(f"  {level}: {count}")
+    level_label = args.level.strip().upper() if args.level.strip() else "(all)"
+    print(f"path:       {display_path}")
+    print(f"level:      {level_label}")
+    print(f"total:      {stats.total_lines}")
+    print("levels:")
+    for lvl, cnt in sorted(stats.level_counts.items(), key=lambda t: (-t[1], t[0])):
+        print(f"  {lvl:8s} {cnt}")
 
     if args.top > 0:
         print(f"top:        {args.top}")
-        for msg, count in summary.top_messages:
-            print(f"{count}\t{msg}")
+        for cnt, msg in stats.top_messages:
+            print(f"{cnt}\t{msg}")
 
     return 0
